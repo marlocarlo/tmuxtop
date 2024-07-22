@@ -4,10 +4,10 @@ import curses
 import psutil
 import subprocess
 import time
-import json
 import os
 from collections import defaultdict, deque
 import argparse
+import shlex
 
 def get_tmux_info():
     sessions = defaultdict(lambda: defaultdict(list))
@@ -29,10 +29,36 @@ def get_tmux_info():
 def get_process_tree(pid):
     try:
         process = psutil.Process(int(pid))
-        children = process.children(recursive=True)
-        return [process] + children
+        return process.children(recursive=True)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return []
+
+def get_actual_command(pid):
+    try:
+        process = psutil.Process(int(pid))
+        children = process.children(recursive=True)
+
+        if children:
+            actual_process = children[-1]
+        else:
+            actual_process = process
+
+        cmd = actual_process.cmdline()
+
+        if cmd and cmd[0] not in ['bash', 'sh', 'zsh', 'fish']:
+            return cmd
+
+        try:
+            with open(f"/proc/{pid}/cmdline", 'rb') as f:
+                content = f.read().decode('utf-8').strip('\x00')
+                if content and not content.startswith(('bash', 'sh', 'zsh', 'fish')):
+                    return content.split('\x00')
+        except:
+            pass
+
+        return None
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return None
 
 class ProcessInfo:
     def __init__(self, process):
@@ -64,26 +90,39 @@ class ProcessInfo:
 
     def _get_graph(self, data):
         if not data:
-            return " " * 20
-        max_value = max(data)
-        if max_value == 0:
-            return " " * 20
+            return " " * 10
+        max_value = max(max(data), 0.1)  # Avoid division by zero
+        graph_chars = "▁▂▃▄▅▆▇"
         graph = ""
         for value in data:
-            height = int((value / max_value) * 8)
-            graph += "█"[8-height:]
-        return graph.ljust(20)
+            height = min(int((value / max_value) * (len(graph_chars) - 1)), len(graph_chars) - 1)
+            graph += graph_chars[height]
+        return graph.ljust(10)
+
 
 class TmuxTop:
     def __init__(self, stdscr):
         self.stdscr = stdscr
-        curses.curs_set(0)
-        self.stdscr.timeout(1000)
+        if stdscr:
+            curses.curs_set(0)
+            self.stdscr.timeout(1000)
+            self.setup_colors()
         self.scroll_position = 0
         self.sessions = {}
         self.process_cache = {}
         self.last_update = 0
         self.update_interval = 2  # Update every 2 seconds
+
+    def setup_colors(self):
+        curses.start_color()
+        curses.use_default_colors()
+
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)  # Default
+        curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)   # Header
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Good status
+        curses.init_pair(4, curses.COLOR_YELLOW, curses.COLOR_BLACK) # Warning status
+        curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)    # Critical status
+        curses.init_pair(6, curses.COLOR_BLUE, curses.COLOR_BLACK)   # Info
 
     def update_data(self):
         current_time = time.time()
@@ -104,39 +143,59 @@ class TmuxTop:
             self.last_update = current_time
 
     def draw_screen(self):
+        if not self.stdscr:
+            return
+
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
 
         # Draw header
-        header = "TmuxTop - Press 'q' to quit, 'e' to export, 'b' to backup, 'r' to restore, Up/Down to scroll"
-        self.stdscr.addstr(0, 0, header.center(width), curses.A_REVERSE)
+        header = " TmuxTop | Press 'q' to quit | 'b' to backup | 'r' to restore | Up/Down to scroll "
+        self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+        self.stdscr.addstr(0, 0, header.center(width))
+        self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
 
         # Draw column headers
-        headers = ["PID", "PPID", "USER", "CPU%", "MEM%", "CPU Graph", "MEM Graph", "TIME", "COMMAND"]
-        header_str = "{:<7} {:<7} {:<8} {:>5} {:>5} {:<20} {:<20} {:<8} {:<}".format(*headers)
-        self.stdscr.addstr(2, 0, header_str, curses.A_BOLD)
+        headers = ["PID", "PPID", "USER", "CPU%", "MEM%", "CPU", "MEM", "TIME", "COMMAND"]
+        header_str = "{:<7} {:<7} {:<8} {:>5} {:>5} {:<10} {:<10} {:<8} {:<}".format(*headers)
+        self.stdscr.attron(curses.color_pair(6) | curses.A_BOLD)
+        self.stdscr.addstr(2, 0, header_str)
+        self.stdscr.attroff(curses.color_pair(6) | curses.A_BOLD)
 
         line = 3
         for session_name, windows in self.sessions.items():
             if line - self.scroll_position >= height:
                 break
             if line >= self.scroll_position:
-                self.stdscr.addstr(line - self.scroll_position, 0, f"Session: {session_name}", curses.A_BOLD | curses.A_UNDERLINE)
+                self.stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+                self.stdscr.addstr(line - self.scroll_position, 0, f"Session: {session_name}")
+                self.stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             line += 1
 
             for window_name, panes in windows.items():
                 if line - self.scroll_position >= height:
                     break
                 if line >= self.scroll_position:
-                    self.stdscr.addstr(line - self.scroll_position, 2, f"Window: {window_name}", curses.A_BOLD)
+                    self.stdscr.attron(curses.color_pair(6))
+                    self.stdscr.addstr(line - self.scroll_position, 2, f"Window: {window_name}")
+                    self.stdscr.attroff(curses.color_pair(6))
                 line += 1
 
                 for pane_index, pid in panes:
                     if line - self.scroll_position >= height:
                         break
                     if line >= self.scroll_position:
-                        self.stdscr.addstr(line - self.scroll_position, 4, f"Pane {pane_index}:", curses.A_BOLD)
+                        self.stdscr.addstr(line - self.scroll_position, 4, f"Pane {pane_index}:")
                     line += 1
+
+                    actual_cmd = get_actual_command(pid)
+                    if actual_cmd:
+                        cmd_str = ' '.join(actual_cmd)
+                        if line - self.scroll_position >= height:
+                            break
+                        if line >= self.scroll_position:
+                            self.stdscr.addnstr(line - self.scroll_position, 6, cmd_str, width - 7)
+                        line += 1
 
                     processes = get_process_tree(pid)
                     for process in processes:
@@ -144,107 +203,100 @@ class TmuxTop:
                         if info:
                             cpu_percent = info.cpu_history[-1] if info.cpu_history else 0
                             mem_percent = info.mem_history[-1] if info.mem_history else 0
-                            cmd_str = ' '.join(info.cmdline)
-                            process_str = f"{info.pid:<7} {info.ppid:<7} {info.username:<8} {cpu_percent:5.1f} {mem_percent:5.1f} {info.get_cpu_graph()} {info.get_mem_graph()} {info.create_time:>8} {cmd_str}"
+                            process_str = f"{info.pid:<7} {info.ppid:<7} {info.username:<8} {cpu_percent:5.1f} {mem_percent:5.1f}"
                             if line - self.scroll_position >= height:
                                 break
                             if line >= self.scroll_position:
-                                self.stdscr.addnstr(line - self.scroll_position, 4, process_str, width - 5)
+                                self.stdscr.addnstr(line - self.scroll_position, 6, process_str, width - 7)
+                                cpu_graph = info.get_cpu_graph()
+                                mem_graph = info.get_mem_graph()
+                                cpu_color = 3 if cpu_percent < 50 else (4 if cpu_percent < 80 else 5)
+                                mem_color = 3 if mem_percent < 50 else (4 if mem_percent < 80 else 5)
+                                self.stdscr.addnstr(line - self.scroll_position, len(process_str) + 6, cpu_graph, 10, curses.color_pair(cpu_color))
+                                self.stdscr.addnstr(line - self.scroll_position, len(process_str) + 17, mem_graph, 10, curses.color_pair(mem_color))
+                                self.stdscr.addnstr(line - self.scroll_position, len(process_str) + 28, f"{info.create_time:>8} {' '.join(info.cmdline)}", width - len(process_str) - 33)
                             line += 1
 
                 line += 1
 
         self.stdscr.refresh()
 
-    def export_data(self):
-        data = {
-            "timestamp": time.time(),
-            "sessions": {}
-        }
-        for session_name, windows in self.sessions.items():
-            data["sessions"][session_name] = {}
-            for window_name, panes in windows.items():
-                data["sessions"][session_name][window_name] = []
-                for pane_index, pid in panes:
-                    pane_data = {
-                        "pane_index": pane_index,
-                        "processes": []
-                    }
-                    processes = get_process_tree(pid)
-                    for process in processes:
-                        info = self.process_cache.get(process.pid)
-                        if info:
-                            pane_data["processes"].append({
-                                "pid": info.pid,
-                                "ppid": info.ppid,
-                                "username": info.username,
-                                "cpu_percent": info.cpu_history[-1] if info.cpu_history else 0,
-                                "mem_percent": info.mem_history[-1] if info.mem_history else 0,
-                                "create_time": info.create_time,
-                                "cmdline": info.cmdline
-                            })
-                    data["sessions"][session_name][window_name].append(pane_data)
-        
-        with open("tmuxtop_export.json", "w") as f:
-            json.dump(data, f, indent=2)
-        
-        self.stdscr.addstr(0, 0, "Data exported to tmuxtop_export.json", curses.A_REVERSE)
-        self.stdscr.refresh()
-        time.sleep(2)
-
     def backup_sessions(self):
         try:
             subprocess.run(["tmux", "list-sessions"], check=True, capture_output=True)
         except subprocess.CalledProcessError:
-            self.stdscr.addstr(0, 0, "No tmux sessions to backup", curses.A_REVERSE)
-            self.stdscr.refresh()
-            time.sleep(2)
+            if self.stdscr:
+                self.stdscr.addstr(0, 0, "No tmux sessions to backup", curses.A_REVERSE)
+                self.stdscr.refresh()
+                time.sleep(2)
+            else:
+                print("No tmux sessions to backup")
             return
 
         backup_file = f"tmux_backup_{int(time.time())}.sh"
         with open(backup_file, "w") as f:
             f.write("#!/bin/bash\n\n")
             f.write("# Tmux session backup created by TmuxTop\n\n")
-            
+
             for session_name in self.sessions:
-                f.write(f"tmux new-session -d -s {session_name}\n")
-                
+                f.write(f"tmux new-session -d -s {shlex.quote(session_name)}\n")
+
                 for window_name, panes in self.sessions[session_name].items():
                     window_index, window_name = window_name.split(':', 1)
-                    f.write(f"tmux rename-window -t {session_name}:{window_index} '{window_name}'\n")
-                    
+                    f.write(f"tmux rename-window -t {shlex.quote(session_name)}:{window_index} {shlex.quote(window_name)}\n")
+
                     for i, (pane_index, pid) in enumerate(panes):
                         if i > 0:
-                            f.write(f"tmux split-window -t {session_name}:{window_index}\n")
-                        f.write(f"tmux send-keys -t {session_name}:{window_index}.{pane_index} 'cd {os.getcwd()}' C-m\n")
-                        
-                        processes = get_process_tree(pid)
-                        if processes:
-                            cmd = ' '.join(processes[0].cmdline())
-                            f.write(f"tmux send-keys -t {session_name}:{window_index}.{pane_index} '{cmd}' C-m\n")
-        
+                            f.write(f"tmux split-window -t {shlex.quote(session_name)}:{window_index}\n")
+
+                        # Get the current working directory of the pane
+                        pane_pwd = subprocess.run(
+                            ["tmux", "display-message", "-p", "-t", f"{session_name}:{window_index}.{pane_index}", "#{pane_current_path}"],
+                            capture_output=True, text=True
+                        ).stdout.strip()
+
+                        f.write(f"tmux send-keys -t {shlex.quote(session_name)}:{window_index}.{pane_index} 'cd {shlex.quote(pane_pwd)}' C-m\n")
+
+                        actual_cmd = get_actual_command(pid)
+                        if actual_cmd:
+                            cmd = ' '.join(shlex.quote(arg) for arg in actual_cmd)
+                            f.write(f"tmux send-keys -t {shlex.quote(session_name)}:{window_index}.{pane_index} {cmd} C-m\n")
+
         os.chmod(backup_file, 0o755)
-        self.stdscr.addstr(0, 0, f"Sessions backed up to {backup_file}", curses.A_REVERSE)
-        self.stdscr.refresh()
-        time.sleep(2)
+        if self.stdscr:
+            self.stdscr.addstr(0, 0, f"Sessions backed up to {backup_file}", curses.A_REVERSE)
+            self.stdscr.refresh()
+            time.sleep(2)
+        else:
+            print(f"Sessions backed up to {backup_file}")
 
     def restore_sessions(self):
         backup_files = [f for f in os.listdir() if f.startswith("tmux_backup_") and f.endswith(".sh")]
         if not backup_files:
-            self.stdscr.addstr(0, 0, "No backup files found", curses.A_REVERSE)
-            self.stdscr.refresh()
-            time.sleep(2)
+            if self.stdscr:
+                self.stdscr.addstr(0, 0, "No backup files found", curses.A_REVERSE)
+                self.stdscr.refresh()
+                time.sleep(2)
+            else:
+                print("No backup files found")
             return
 
         latest_backup = max(backup_files, key=os.path.getctime)
         try:
             subprocess.run(["bash", latest_backup], check=True)
-            self.stdscr.addstr(0, 0, f"Sessions restored from {latest_backup}", curses.A_REVERSE)
+            if self.stdscr:
+                self.stdscr.addstr(0, 0, f"Sessions restored from {latest_backup}", curses.A_REVERSE)
+            else:
+                print(f"Sessions restored from {latest_backup}")
         except subprocess.CalledProcessError:
-            self.stdscr.addstr(0, 0, f"Failed to restore sessions from {latest_backup}", curses.A_REVERSE)
-        
-        self.stdscr.refresh()
-        time.sleep(2)
+            if self.stdscr:
+                self.stdscr.addstr(0, 0, f"Failed to restore sessions from {latest_backup}", curses.A_REVERSE)
+            else:
+                print(f"Failed to restore sessions from {latest_backup}")
+
+        if self.stdscr:
+            self.stdscr.refresh()
+            time.sleep(2)
 
     def run(self):
         while True:
@@ -255,8 +307,6 @@ class TmuxTop:
             key = self.stdscr.getch()
             if key == ord('q'):
                 break
-            elif key == ord('e'):
-                self.export_data()
             elif key == ord('b'):
                 self.backup_sessions()
             elif key == ord('r'):
@@ -271,23 +321,13 @@ def main(stdscr):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TmuxTop - Tmux Process Monitor")
-    parser.add_argument("--export", action="store_true", help="Export data to JSON file")
     parser.add_argument("--backup", action="store_true", help="Backup tmux sessions")
     parser.add_argument("--restore", action="store_true", help="Restore tmux sessions")
     args = parser.parse_args()
 
-    if args.export:
-        tmux_top = TmuxTop(None)
-        tmux_top.update_data()
-        tmux_top.export_data()
-        print("Data exported to tmuxtop_export.json")
-    elif args.backup:
-        tmux_top = TmuxTop(None)
-        tmux_top.update_data()
-        tmux_top.backup_sessions()
-        print("Sessions backed up")
+    if args.backup:
+        TmuxTop(None).backup_sessions()
     elif args.restore:
         TmuxTop(None).restore_sessions()
-        print("Sessions restored")
     else:
         curses.wrapper(main)
