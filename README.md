@@ -82,7 +82,7 @@ Copy code
 Screenshots
 -----------
 
-*Include screenshots of TmuxTop interface showing real-time monitoring, navigation through sessions and panes, and the export/backup/restore process.*
+![image](https://github.com/user-attachments/assets/af7dccdc-bbec-4fa5-a154-08b0bfd29815)
 
 Advanced Usage
 --------------
