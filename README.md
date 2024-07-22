@@ -1,4 +1,4 @@
-# TmuxTop
+# Tmux Top - Summary of tmux on your pc plus the ability to backup and restore
 
 ## Overview
 TmuxTop is an advanced Tmux process monitoring tool that provides a top-like interface for managing and monitoring processes within Tmux sessions. This tool leverages a terminal user interface (TUI) to display real-time data on CPU and memory usage of processes running in Tmux panes. Additionally, TmuxTop includes features for exporting session data, and backing up and restoring Tmux sessions.
